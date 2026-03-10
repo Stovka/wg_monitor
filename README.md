@@ -1,5 +1,5 @@
 # WireGuard Peer Monitor (wg_monitor.sh)
-A shell script that logs peer connections and disconnections to a WireGuard server. It parses `wg show all dump` (last handshake) to determine who connected/disconnected to Wireguard server.
+A shell script that logs peer connections and disconnections to a WireGuard server. It parses `wg show all dump` (last handshake) to determine who connected/disconnected to WireGuard server.
 
 
 ## Features
