@@ -114,9 +114,13 @@ while read iface key psk endpoint allowed latest rx tx keepalive; do
             log_event "$cur_ts" "$hs" "$iface" "$msg_connected" "$key" "$name" "$ip"
             echo "$iface $key $name $ip" >> "$log_state"
 
-        # Check for roaming
         else
-            read _ _ oldname oldip <<< "$(grep "^$id " "$log_state")"
+            # Check for roaming
+            oldline=$(grep "^$id " "$log_state")
+            oldname=${oldline#"$iface $key "}
+            oldip=${oldname##* }
+            oldname=${oldname% $oldip}
+
             if [[ "$oldip" != "$ip" ]]; then
                 hs=$(date -u -d @"$latest" +%FT%TZ)
                 log_event "$cur_ts" "$hs" "$iface" "$msg_roamed" "$key" "$name" "$oldip->$ip"
@@ -130,7 +134,11 @@ while read iface key psk endpoint allowed latest rx tx keepalive; do
     else
         # Peer disconnected
         if grep -q "^$id " "$log_state"; then
-            read _ _ oldname oldip <<< "$(grep "^$id " "$log_state")"
+            oldline=$(grep "^$id " "$log_state")
+            oldname=${oldline#"$iface $key "}
+            oldip=${oldname##* }
+            oldname=${oldname% $oldip}
+
             hs=$(date -u -d @"$latest" +%FT%TZ)
             log_event "$cur_ts" "$hs" "$iface" "$msg_disconnected" "$key" "$oldname" "$oldip"
 
