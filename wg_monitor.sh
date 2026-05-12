@@ -13,8 +13,13 @@ peers="/etc/wireguard/peers"    # optional peer aliases file
 # - format:
 # wg_public_key1:Client1
 # wg_public_key2:Client2
-format="sep"                    # json | sep
-sep="|"                         # used only when format=sep
+format="sep"                       # json | sep
+sep="|"                            # used only when format=sep
+datetime_format="local_datetime"   # local_datetime/offset_datetime/gmt/unix_timestamp
+# local_datetime  = YYYY-MM-DDThh:mm:ss
+# offset_datetime = YYYY-MM-DDThh:mm:ss+01:00
+# gmt             = YYYY-MM-DDThh:mm:ssZ
+# unix_timestamp  = 1767225600
 
 # Log and state files
 log_file="/var/log/wg_monitor.log"   # empty = do not log to file
@@ -153,6 +158,16 @@ validate_config() {
         fi
     fi
 
+    # validate datetime_format
+    case "$datetime_format" in
+        local_datetime|offset_datetime|gmt|unix_timestamp)
+            ;;
+        *)
+            echo "ERROR: datetime_format must be one of: local_datetime, offset_datetime, gmt, unix_timestamp"
+            exit 1
+            ;;
+    esac
+
     # Validate log_fields not empty
     if [[ ${#log_fields[@]} -eq 0 ]]; then
         echo "ERROR: log_fields must contain at least one field"
@@ -207,12 +222,43 @@ validate_config() {
 # --- Run validation ---
 validate_config
 
-# --- Define date_from_epoch
+# --- Datetime formatter ---
+
+date_cmd_supports_r=false
 if date -r 0 >/dev/null 2>&1; then
-  date_from_epoch() { date -u -r "$1" +%FT%TZ; }
-else
-  date_from_epoch() { date -u -d "@$1" +%FT%TZ; }
+    date_cmd_supports_r=true
 fi
+
+format_datetime() {
+    local epoch="$1"
+
+    case "$datetime_format" in
+        gmt)
+            if [[ "$date_cmd_supports_r" == "true" ]]; then
+                date -u -r "$epoch" +%FT%TZ
+            else
+                date -u -d "@$epoch" +%FT%TZ
+            fi
+            ;;
+        local_datetime)
+            if [[ "$date_cmd_supports_r" == "true" ]]; then
+                date -r "$epoch" +%FT%T
+            else
+                date -d "@$epoch" +%FT%T
+            fi
+            ;;
+        offset_datetime)
+            if [[ "$date_cmd_supports_r" == "true" ]]; then
+                date -r "$epoch" +%FT%T%:z
+            else
+                date -d "@$epoch" +%FT%T%:z
+            fi
+            ;;
+        unix_timestamp)
+            echo "$epoch"
+            ;;
+    esac
+}
 
 # --- Load peer aliases (optional) ---
 declare -A peer_aliases
@@ -237,8 +283,7 @@ while IFS='|' read -r iface key name ip connected_since; do
 done < "$log_state" || true
 
 now=$(date +%s)
-printf -v cur_ts '%(%Y-%m-%dT%H:%M:%SZ)T' -1
-
+cur_ts=$(format_datetime "$now")
 
 # --- Iterate over WireGuard peers ---
 wg_dump=$("$WGCOMMAND" show all dump) || {
@@ -264,7 +309,7 @@ while IFS=$'\t' read -r iface key psk endpoint allowed latest rx tx keepalive ex
     ip="${ip//|/}"
 
     if [[ "$latest" != "0" ]]; then
-        hs=$(date_from_epoch "$latest")
+        hs=$(format_datetime "$latest")
     else
         hs="$cur_ts"
     fi
