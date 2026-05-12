@@ -91,30 +91,31 @@ journalctl -u wg_monitor.service
   - Compatible with `wgg` https://github.com/FlyveHest/wg-friendly-peer-names/
 - `format="json"` - Whether it should log in json or values with separator
 - `sep="|"` - Custom separator (Only used when combined with `format="sep"`)
+- `datetime_format="local_datetime"` - Log format of date-time (options: local_datetime/offset_datetime/gmt/unix_timestamp)
 - `log_path="/var/log/wg_monitor.log"` - Path to log file
 - `log_state="/var/run/wg_monitor.connected"` - Path to file where current connections are tracked (from previous run)
 - `log_journal=true` - Whether to log into journal
 - `logger_name="wg_monitor"` - Name of the logger in journal (Only used when combined with `log_journal=true`)
 - `json_*` - Custom keys for json format
 - `msg_*` - Custom messages for connection, ...
-- `log_fields=(ts hs iface msg peer host ip)` - Fields that should be logged and their order
+- `log_fields=(ts hs duration iface msg peer host ip)` - Fields that should be logged and their order
 
 ## Example of logs
 - Default sep format:
 ```
-2026-03-10T12:00:01Z|2026-03-10T11:35:00Z|1|wg0|CONNECTED|LuQ3bL0T0xxxxxxxO0yWc=|Client1|85.193.1.1
-2026-03-10T12:06:01Z|2026-03-10T12:05:13Z|1813|wg0|ROAMED|LuQ3bL0T0xxxxxxxO0yWc=|Client1|85.193.1.1->85.193.2.2
-2026-03-10T12:10:01Z|2026-03-10T12:09:23Z|2063|wg0|DISCONNECTED|LuQ3bL0T0xxxxxxxO0yWc=|Client1|85.193.2.2
+2026-03-10T12:00:01|2026-03-10T11:35:00|1|wg0|CONNECTED|LuQ3bL0T0xxxxxxxO0yWc=|Client1|85.193.1.1
+2026-03-10T12:06:01|2026-03-10T12:05:13|1813|wg0|ROAMED|LuQ3bL0T0xxxxxxxO0yWc=|Client1|85.193.1.1->85.193.2.2
+2026-03-10T12:10:01|2026-03-10T12:09:23|2063|wg0|DISCONNECTED|LuQ3bL0T0xxxxxxxO0yWc=|Client1|85.193.2.2
 ```
 - Default json format:
 ```
-{"ts":"2026-03-10T12:00:01Z","hs":"2026-03-10T11:35:00Z","d":"1","i":"wg0","m":"CONNECTED","p":"LuQ3bL0T0xxxxxxxO0yWc=","h":"Phone","ip":"85.193.1.1"}
-{"ts":"2026-03-10T12:06:01Z","hs":"2026-03-10T12:05:13Z","d":"1813","i":"wg0","m":"ROAMED","p":"LuQ3bL0T0xxxxxxxO0yWc=","h":"Phone","ip":"85.193.1.1->85.193.2.2"}
-{"ts":"2026-03-10T12:10:01Z","hs":"2026-03-10T12:09:23Z","d":"2063","i":"wg0","m":"DISCONNECTED","p":"LuQ3bL0T0xxxxxxxO0yWc=","h":"Phone","ip":"85.193.2.2"}
+{"ts":"2026-03-10T12:00:01","hs":"2026-03-10T11:35:00","d":"1","i":"wg0","m":"CONNECTED","p":"LuQ3bL0T0xxxxxxxO0yWc=","h":"Phone","ip":"85.193.1.1"}
+{"ts":"2026-03-10T12:06:01","hs":"2026-03-10T12:05:13","d":"1813","i":"wg0","m":"ROAMED","p":"LuQ3bL0T0xxxxxxxO0yWc=","h":"Phone","ip":"85.193.1.1->85.193.2.2"}
+{"ts":"2026-03-10T12:10:01","hs":"2026-03-10T12:09:23","d":"2063","i":"wg0","m":"DISCONNECTED","p":"LuQ3bL0T0xxxxxxxO0yWc=","h":"Phone","ip":"85.193.2.2"}
 ```
 - Default sep format in journal
 ```
-mar 03 12:00:01 user wg_monitor[488199]: 2026-03-10T12:00:01Z|2026-03-10T11:35:00Z|1|wg0|CONNECTED|LuQ3bL0T0xxxxxxxO0yWc=|Client1|85.193.1.1
-mar 03 12:06:01 user wg_monitor[488200]: 2026-03-10T12:06:01Z|2026-03-10T12:05:13Z|1813|wg0|ROAMED|LuQ3bL0T0xxxxxxxO0yWc=|Client1|85.193.1.1->85.193.2.2
-mar 03 12:10:01 user wg_monitor[488201]: 2026-03-10T12:10:01Z|2026-03-10T12:09:23Z|2063|wg0|DISCONNECTED|LuQ3bL0T0xxxxxxxO0yWc=|Client1|85.193.2.2
+mar 03 12:00:01 user wg_monitor[488199]: 2026-03-10T12:00:01|2026-03-10T11:35:00|1|wg0|CONNECTED|LuQ3bL0T0xxxxxxxO0yWc=|Client1|85.193.1.1
+mar 03 12:06:01 user wg_monitor[488200]: 2026-03-10T12:06:01|2026-03-10T12:05:13|1813|wg0|ROAMED|LuQ3bL0T0xxxxxxxO0yWc=|Client1|85.193.1.1->85.193.2.2
+mar 03 12:10:01 user wg_monitor[488201]: 2026-03-10T12:10:01|2026-03-10T12:09:23|2063|wg0|DISCONNECTED|LuQ3bL0T0xxxxxxxO0yWc=|Client1|85.193.2.2
 ```
