@@ -2,11 +2,9 @@
 
 set -euo pipefail
 
-exec 200>/var/run/wg_monitor.lock
-flock -n 200 || exit 0
-
 # ----------------- Settings -----------------
 threshold=300                   # seconds after last handshake to consider disconnected
+interval=60                     # Interval between checks (only used with --watch option)
 peers="/etc/wireguard/peers"    # optional peer aliases file
 # Optional peers file containing friendly aliases for WG public keys
 # - compatible with https://github.com/FlyveHest/wg-friendly-peer-names/
@@ -62,6 +60,55 @@ declare -A json_field_map=(
     [ip]="$json_ip"
 )
 
+
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  --watch                Run in continuous mode
+  --interval <seconds>   Interval between WG checks
+  -h, --help             Show this help
+EOF
+}
+
+
+# --- Arguments parsing ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --watch)
+            continuous=true
+            shift
+            ;;
+        --interval)
+            if [[ $# -lt 2 ]]; then
+                echo "ERROR: --interval requires a value" >&2
+                usage
+                exit 1
+            fi
+            interval="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "ERROR: Unknown argument: $1" >&2
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+
+continuous=${continuous:-false}
+running=true
+
+shutdown() {
+    running=false
+}
+
 # --- Logging function ---
 log_event() {
     local ts="$1"
@@ -79,6 +126,7 @@ log_event() {
     local line=""
 
     if [[ "$format" == "json" ]]; then
+        # JSON
         line="{"
         local first=1
         for f in "${log_fields[@]}"; do
@@ -86,31 +134,35 @@ log_event() {
             val="${fields[$f]:-}"
             val="${val//\\/\\\\}"       # backslash
             val="${val//\"/\\\"}"       # double quote
-            val="${val//$'\t'/\\t}"     # tab
             val="${val//$'\n'/\\n}"     # newline
             val="${val//$'\r'/\\r}"     # carriage return
+            val="${val//$'\t'/\\t}"     # tab
             line+="\"${json_field_map[$f]:-$f}\":\"$val\""
             first=0
         done
         line+="}"
     else
+        # Separator
         for f in "${log_fields[@]}"; do
             [[ -n "$line" ]] && line+="$sep"
             val="${fields[$f]:-}"
-            val="${val//$sep/}"         # strip separator characters
+            # sep format value sanitization
+            val="${val//$sep/}"
+            val="${val//$'\n'/}"
+            val="${val//$'\r'/}"
+            val="${val//$'\t'/}"
             line+="$val"
         done
     fi
 
     if [[ -n "$log_file" ]]; then
-        echo "$line" >> "$log_file"
+        echo "$line" >> "$log_file" || true
     fi
 
     if [[ "$log_journal" == "true" ]]; then
-        logger -t "$logger_name" -- "$line"
+        logger -t "$logger_name" -- "$line" || true
     fi
 }
-
 
 # --- Validation config function ---
 validate_config() {
@@ -118,6 +170,12 @@ validate_config() {
     # Detect full path to wg command
     WGCOMMAND=$(command -v wg) || {
         echo "ERROR: wg command not found"
+        exit 1
+    }
+
+    # Check if flock exists
+    command -v flock >/dev/null || {
+        echo "ERROR: flock not found"
         exit 1
     }
 
@@ -150,10 +208,14 @@ validate_config() {
         exit 1
     fi
 
-    # validate sep is not a base64 character (would break log)
+    # validate sep is not a base64 character or white space (would break log)
     if [[ "$format" == "sep" ]]; then
         if [[ "$sep" =~ [A-Za-z0-9+/=] ]]; then
             echo "ERROR: sep cannot be a base64 character (A-Z, a-z, 0-9, +, /, =)"
+            exit 1
+        fi
+        if [[ "$sep" =~ [[:space:]] ]]; then
+            echo "ERROR: sep cannot be a whitespace character"
             exit 1
         fi
     fi
@@ -173,6 +235,16 @@ validate_config() {
         echo "ERROR: log_fields must contain at least one field"
         exit 1
     fi
+
+    # Validate log_fields duplicates
+    declare -A _seen_fields
+    for field in "${log_fields[@]}"; do
+        if [[ -n "${_seen_fields[$field]:-}" ]]; then
+            echo "ERROR: Duplicate field in log_fields: $field"
+            exit 1
+        fi
+        _seen_fields[$field]=1
+    done
 
     # Validate log_fields content
     allowed_fields=(ts hs duration iface msg peer host ip)
@@ -218,12 +290,15 @@ validate_config() {
             exit 1
         }
     fi
+
+    # validate interval
+    if ! [[ "$interval" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: interval must be a positive integer greater than 0"
+        exit 1
+    fi
 }
-# --- Run validation ---
-validate_config
 
 # --- Datetime formatter ---
-
 date_cmd_supports_r=false
 if date -r 0 >/dev/null 2>&1; then
     date_cmd_supports_r=true
@@ -262,120 +337,183 @@ format_datetime() {
 
 # --- Load peer aliases (optional) ---
 declare -A peer_aliases
-if [[ -f "$peers" ]]; then
-    while IFS= read -r line; do
-        # Ignore empty lines, comments, lines without :
-        [[ -z "$line" ]] && continue
-        [[ "$line" == \#* ]] && continue
-        [[ "$line" != *:* ]] && continue
-        key="${line%%:*}"
-        name_rest="${line#*:}"
-        peer_aliases[$key]="$name_rest"
-    done < "$peers"
-fi
-
-# --- Load current state ---
-declare -A state
-declare -A seen
-while IFS='|' read -r iface key name ip connected_since; do
-    id="$iface|$key"
-    state["$id"]="$name|$ip|$connected_since"
-done < "$log_state" || true
-
-now=$(date +%s)
-cur_ts=$(format_datetime "$now")
-
-# --- Iterate over WireGuard peers ---
-wg_dump=$("$WGCOMMAND" show all dump) || {
-    echo "ERROR: wg show all dump failed" >&2
-    exit 1
-}
-while IFS=$'\t' read -r iface key psk endpoint allowed latest rx tx keepalive extra; do
-    # Skip interface header lines (fewer fields, latest will be empty)
-    [[ -z "$latest" ]] && continue
-    # Skip peers that have never connected
-    [[ "$latest" == "0" && "$endpoint" == "(none)" ]] && continue
-
-    # Extract IP from endpoint (handles both IPv4 host:port and [IPv6]:port)
-    ip=${endpoint%:*}; ip=${ip#[}; ip=${ip%]}
-
-    age=$((now - latest))
-    id="$iface|$key"
-    seen["$id"]=1
-
-    # Resolve alias and sanitize user-controlled fields before any use
-    name="${peer_aliases[$key]:-}"
-    name="${name//|/}"
-    ip="${ip//|/}"
-
-    if [[ "$latest" != "0" ]]; then
-        hs=$(format_datetime "$latest")
-    else
-        hs="$cur_ts"
+load_aliases() {
+    peer_aliases=()
+    if [[ -f "$peers" ]]; then
+        while IFS= read -r line || [[ -n "${line:-}" ]]; do
+            # Ignore empty lines, comments, lines without :
+            [[ -z "$line" ]] && continue
+            [[ "$line" == \#* ]] && continue
+            [[ "$line" != *:* ]] && continue
+            key="${line%%:*}"
+            name_rest="${line#*:}"
+            peer_aliases[$key]="$name_rest"
+        done < "$peers"
     fi
+}
 
-    if (( age < threshold )); then
-        if [[ -z "${state[$id]:-}" ]]; then
-            # New connection: peer not in state, now within threshold
-            # duration = now - last handshake
-            connected_since="$latest"
-            duration=$(( now - latest ))
-            log_event "$cur_ts" "$hs" "$duration" "$iface" "$msg_connected" "$key" "$name" "$ip"
+# --- Single run ---
+run_once() {
+    now=$(date +%s)
+    cur_ts=$(format_datetime "$now")
+
+    # Load previous state
+    declare -A state
+    declare -A seen
+    while IFS='|' read -r iface key name ip connected_since extra || [[ -n "${iface:-}" ]]; do
+        # skip malformed
+        [[ -n "$extra" ]] && continue 
+        [[ -z "$iface" || -z "$key" ]] && continue
+        [[ "$connected_since" =~ ^[0-9]+$ ]] || continue
+        id="$iface|$key"
+        state["$id"]="$name|$ip|$connected_since"
+    done < "$log_state" || true
+
+    # Iterate over current WireGuard peers
+    if ! wg_dump=$("$WGCOMMAND" show all dump); then
+        echo "ERROR: wg show all dump failed" >&2
+        return 1
+    fi
+    while IFS=$'\t' read -r iface key psk endpoint allowed latest rx tx keepalive extra; do
+        # Skip interface header lines (fewer fields, latest will be empty)
+        [[ -z "$latest" ]] && continue
+        # Skip peers that have never connected
+        [[ "$latest" == "0" && "$endpoint" == "(none)" ]] && continue
+        # Skip if latest is not a number
+        if ! [[ "$latest" =~ ^[0-9]+$ ]]; then
+            continue
+        fi
+
+        # Extract IP from endpoint (handles IPv4 host:port, [IPv6]:port, hostname)
+        case "$endpoint" in
+            \[*\]:*) ip="${endpoint#\[}"; ip="${ip%%\]:*}" ;;
+            *:*)     ip="${endpoint%:*}" ;;
+            *)        ip="$endpoint" ;;
+        esac
+
+
+        if (( latest > now )); then
+            latest="$now"  # Overwrite latest to now if latest is greater 
+        fi
+        age=$((now - latest))
+        id="$iface|$key"
+        seen["$id"]=1
+
+        # Resolve alias and sanitize user-controlled fields
+        name="${peer_aliases[$key]:-}"
+        name="${name//|/}"
+        ip="${ip//|/}"
+
+        if [[ "$latest" != "0" ]]; then
+            hs=$(format_datetime "$latest")
         else
-            # Already connected: check for roam (IP change)
-            # extract original connected_since, preserve it on roam
-            connected_since="${state[$id]##*|}"
-            oldip="${state[$id]#*|}"
-            oldip="${oldip%|*}"
-            if [[ "$oldip" != "$ip" ]]; then
-                duration=$(( now - connected_since ))
-                log_event "$cur_ts" "$hs" "$duration" "$iface" "$msg_roamed" "$key" "$name" "${oldip}->${ip}"
+            hs="$cur_ts"
+        fi
+
+        if (( age < threshold )); then
+            if [[ -z "${state[$id]:-}" ]]; then
+                # New connection: peer not in previous state
+                connected_since="$latest"
+                # duration = now - last handshake
+                duration=$(( now - latest ))
+                log_event "$cur_ts" "$hs" "$duration" "$iface" "$msg_connected" "$key" "$name" "$ip"
+            else
+                # Already connected: check for roam (IP change)
+                # extract original connected_since, preserve it on roam
+                connected_since="${state[$id]##*|}"
+                oldip="${state[$id]#*|}"
+                oldip="${oldip%|*}"
+                if [[ "$oldip" != "$ip" ]]; then
+                    duration=$(( now - connected_since ))
+                    log_event "$cur_ts" "$hs" "$duration" "$iface" "$msg_roamed" "$key" "$name" "${oldip}->${ip}"
+                fi
+            fi
+            # Update state preserving original connected_since
+            state["$id"]="$name|$ip|$connected_since"
+        else
+            # Disconnect: log disconnect if it was previously connected
+            if [[ -n "${state[$id]:-}" ]]; then
+                oldname="${state[$id]%%|*}"
+                rest="${state[$id]#*|}"
+                oldip="${rest%|*}"
+                connected_since="${rest##*|}"
+                duration=$(( now - connected_since - threshold ))  # Subtract threshold to get more accurate reading
+                (( duration < 0 )) && duration=0
+                log_event "$cur_ts" "$hs" "$duration" "$iface" "$msg_disconnected" "$key" "$oldname" "$oldip"
+                unset 'state[$id]'
             fi
         fi
-        # Update state preserving original connected_since
-        state["$id"]="$name|$ip|$connected_since"
-    else
-        # Disconnect: log disconnect if it was previously connected
-        if [[ -n "${state[$id]:-}" ]]; then
+    done <<< "$wg_dump"
+
+    # Handle removed peers (peer disappeared from wg output entirely)
+    # This happens on client when WG is shutdown. On server only when its restarted and client was removed or WG shutdown 
+    for id in "${!state[@]}"; do
+        if [[ -z "${seen[$id]:-}" ]]; then
+            iface="${id%%|*}"
+            key="${id#*|}"
             oldname="${state[$id]%%|*}"
             rest="${state[$id]#*|}"
             oldip="${rest%|*}"
-            # duration = now - connected_since
             connected_since="${rest##*|}"
+            # There is no threshold subtraction because this is being run every time not only when age < threshold
+            # Duration will be skewed randomly on average interval / 2 in continuous mode
             duration=$(( now - connected_since ))
+            hs="$cur_ts"  # Set hs to cur_ts because hs is unknown
             log_event "$cur_ts" "$hs" "$duration" "$iface" "$msg_disconnected" "$key" "$oldname" "$oldip"
             unset 'state[$id]'
         fi
-    fi
-done <<< "$wg_dump"
+    done
 
-# --- Handle peers removed entirely ---
-for id in "${!state[@]}"; do
-    if [[ -z "${seen[$id]:-}" ]]; then
-        iface="${id%%|*}"
-        key="${id#*|}"
-        oldname="${state[$id]%%|*}"
+    # Update state file
+    if ! tmp_state=$(mktemp "${log_state}.XXXXXX"); then
+        echo "ERROR: mktemp failed" >&2
+        return 1
+    fi
+    for id in "${!state[@]}"; do
+        iface="${id%%|*}"; key="${id#*|}"
         rest="${state[$id]#*|}"
-        oldip="${rest%|*}"
+        name="${state[$id]%%|*}"
+        ip="${rest%|*}"
         connected_since="${rest##*|}"
-        duration=$(( now - connected_since ))
-        hs="$cur_ts"  # Set hs to cur_ts because hs is unknown
-        log_event "$cur_ts" "$hs" "$duration" "$iface" "$msg_disconnected" "$key" "$oldname" "$oldip"
-        unset 'state[$id]'
+        name="${name//|/}"
+        ip="${ip//|/}"
+        printf '%s\n' "$iface|$key|$name|$ip|$connected_since"
+    done > "$tmp_state"
+    if ! mv -f "$tmp_state" "$log_state"; then
+        rm -f "$tmp_state"
+        echo "ERROR: failed to update state file" >&2
+        return 1
     fi
-done
+}
 
-# --- Write back the updated state ---
-tmp_state=$(mktemp "${log_state}.XXXXXX")
-trap 'rm -f "$tmp_state"' EXIT
-for id in "${!state[@]}"; do
-    iface="${id%%|*}"; key="${id#*|}"
-    rest="${state[$id]#*|}"
-    name="${state[$id]%%|*}"
-    ip="${rest%|*}"
-    connected_since="${rest##*|}"
-    name="${name//|/}"
-    ip="${ip//|/}"
-    printf '%s\n' "$iface|$key|$name|$ip|$connected_since"
-done > "$tmp_state"
-mv -f "$tmp_state" "$log_state"
+
+validate_config
+load_aliases
+lock_file="${log_state}.lock"
+exec 200>"$lock_file"
+if ! flock -n 200; then
+    printf "ERROR: Already running."
+    exec 200>&-
+    if command -v fuser >/dev/null; then
+        printf " Lock held by PID(s): "
+        fuser "$lock_file" 2>/dev/null
+    fi
+    echo
+    exit 1
+fi
+
+sleep_pid=0
+trap 'running=false; [[ $sleep_pid -ne 0 ]] && kill "$sleep_pid" 2>/dev/null || true' TERM INT HUP
+trap 'exec 200>&-' EXIT
+
+if [[ "$continuous" == "true" ]]; then
+    while $running; do
+        run_once || echo "WARNING: run_once failed, retrying in ${interval}s" >&2
+        ( exec 200>&-; sleep "$interval" ) &  # Release fd in child
+        sleep_pid=$!
+        wait $sleep_pid || true
+        sleep_pid=0  # Prevent trap killing reused PID when interrupted in run_once
+    done
+else
+    run_once
+fi
