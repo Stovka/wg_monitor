@@ -1,5 +1,5 @@
 # WireGuard Peer Monitor (wg_monitor.sh)
-A shell script that logs peer connections and disconnections to a WireGuard server. It parses `wg show all dump` (last handshake) to determine who connected/disconnected to Wireguard server. It also works for WireGuard clients - tracking outgoing connections per WG interface.
+A shell script that logs WireGuard peer connections, disconnections and roaming. It parses `wg show all dump` (last handshake) to determine who connected/disconnected to Wireguard server. It also works for WireGuard clients - tracking outgoing connections per WG interface.
 
 
 ## Features
@@ -37,55 +37,66 @@ nano /etc/wireguard/peers
 - You can test it by running it directly (`./wg_monitor.sh`)
   - By default it logs to `/var/log/wg_monitor.log` current connections are tracked in `/var/run/wg_monitor.connected`
   - You can change where and how it should log
-- To monitor WG clients continuously you need to run it periodically
-- For that you can use whatever scheduling mechanism you prefer.
-- For example you can create CRON job
+- To monitor WG clients continuously you have 2 options:
+  - Run it periodically via cron/systemd timer
+  - Run it in continuos mode (`./wg_monitor.sh --watch`)
+    - This is preferred method (reducing overhead and system logs)
+    - You can also specify `--interval` which sets sleep time between wg checks
+- Example CRON job to run the script periodically:
 ```bash
 sudo crontab -e
 
 # Run /usr/local/bin/wg_monitor.sh every minute
 * * * * * /usr/local/bin/wg_monitor.sh
 ```
-- Or you can create service
-```bash
-# /etc/systemd/system/wg_monitor.timer
-[Unit]
-Description=WireGuard peer monitor
-
-[Timer]
-OnBootSec=30
-OnUnitActiveSec=60
-AccuracySec=5
-
-[Install]
-WantedBy=timers.target
-```
-
+- Example service to run the script continuously:
+  - Configuration is loaded once when the script starts that means when you edit config or peers aliases file script needs to be restarted
 ```bash
 # /etc/systemd/system/wg_monitor.service
 [Unit]
-Description=WireGuard peer monitor
+Description=WireGuard Peer Monitor
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=oneshot
-ExecStart=/usr/local/bin/wg_monitor.sh
+Type=simple
+
+ExecStart=/usr/local/bin/wg_monitor.sh --watch --interval 60
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ```bash
 sudo systemctl daemon-reload
 
-systemctl enable wg_monitor.timer
-systemctl start wg_monitor.timer
-# systemctl disable wg_monitor.timer
-# systemctl stop wg_monitor.timer
+systemctl enable wg_monitor.service
+systemctl start wg_monitor.service
+# systemctl disable wg_monitor.service
+# systemctl stop wg_monitor.service
+# systemctl reload wg_monitor.service
+# systemctl restart wg_monitor.service
 
-systemctl status wg_monitor.timer
 systemctl status wg_monitor.service
 journalctl -u wg_monitor.service
 ```
 
 ## Configuration
-- `threshold=300` - Seconds after last handshake to consider a peer disconnected
+- `threshold=300`
+  - Seconds after last handshake to consider a peer disconnected
+  - You can lower this if your clients do handshakes often.
+- `interval=60`
+  - This is only used when script is being run in continuous mode (--watch)
+  - Interval between wg dump checks 
 - `peers="/etc/wireguard/peers"` 
   - Path to peers file containing wg_public_key:friendly_name
   - Compatible with `wgg` https://github.com/FlyveHest/wg-friendly-peer-names/
